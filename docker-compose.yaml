@@ -8,7 +8,6 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: inbox_db
 
     ports:
       - "5432:5432"
@@ -21,6 +20,18 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  migrations:
+    image: pressly/goose:latest
+    depends_on:
+      - postgres
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: postgresql://admin:пароль@postgres:5432/payments-service-db?sslmode=disable
+    volumes:
+      - ./migrations:/migrations
+    command: up
+    restart: on-failure
 
 volumes:
   postgres_data:
