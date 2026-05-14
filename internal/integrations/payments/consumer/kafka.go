@@ -22,16 +22,16 @@ type Listener struct {
 func NewListener(brokers []string, topic, group string, uc PaymentProcessor) *Listener {
 	return &Listener{
 		reader: kafka.NewReader(kafka.ReaderConfig{
-			Brokers: brokers,
-			Topic:   topic,
-			GroupID: group,
+			Brokers:     brokers,
+			Topic:       topic,
+			GroupID:     group,
+			StartOffset: kafka.FirstOffset,
 		}),
 		uc: uc,
 	}
 }
 
 type Envelope struct {
-	Schema  any    `json:"schema"`
 	Payload string `json:"payload"`
 }
 
@@ -41,7 +41,7 @@ func (l *Listener) Listen(ctx context.Context) {
 	for {
 		msg, err := l.reader.ReadMessage(ctx)
 		if err != nil {
-			log.Println(err)
+			log.Println("read error:", err)
 			continue
 		}
 

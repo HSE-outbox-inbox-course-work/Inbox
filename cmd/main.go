@@ -1,4 +1,4 @@
-package cmd
+package main
 
 import (
 	"context"
@@ -8,60 +8,70 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
 
 	"inbox/internal/integrations/dlq"
-	"inbox/internal/integrations/payments/consumer"
-	"inbox/internal/repo"
+	kafka "inbox/internal/integrations/payments/consumer"
+	repository "inbox/internal/repo"
 	"inbox/internal/usecases"
 )
 
+const migrationsPath = "internal/migrations"
+
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	dsn := getenv("INBOX_DB_DSN",
+		"postgres://postgres:postgres@localhost:5433/inbox?sslmode=disable")
+	brokers := []string{getenv("INBOX_KAFKA_BROKER", "localhost:29092")}
+	topic := getenv("INBOX_KAFKA_TOPIC", "accounts.money.transferred")
+	group := getenv("INBOX_KAFKA_GROUP", "inbox-service")
+	dlqTopic := getenv("INBOX_DLQ_TOPIC", "dead-letter-queue")
 
-	// --- DB ---
-	dbpool, err := pgxpool.New(ctx, "postgres://user:password@localhost:5432/app?sslmode=disable")
+	dbpool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		log.Fatal("db connection error:", err)
+		log.Fatalf("db connection error: %v", err)
 	}
 	defer dbpool.Close()
 
-	// --- repositories ---
+	if err := dbpool.Ping(ctx); err != nil {
+		log.Fatalf("db ping error: %v", err)
+	}
+
+	if err := runMigrations(dbpool); err != nil {
+		log.Fatalf("migrations failed: %v", err)
+	}
+
 	inboxRepo := repository.NewInboxRepository(dbpool)
 	processedRepo := repository.NewProcessedRepository(dbpool)
 
-	// --- DLQ (простая заглушка, потом можно заменить на Kafka topic) ---
-	dlqProducer := dlq.NewDLQProducer(
-		[]string{"localhost:9092"},
-		"dead-letter-queue",
-	)
-	// --- usecase ---
-	paymentUC := usecases.NewPaymentUseCase(
-		inboxRepo,
-		processedRepo,
-		dlqProducer,
-	)
+	dlqProducer := dlq.NewDLQProducer(brokers, dlqTopic)
 
-	// --- kafka listener ---
-	listener := kafka.NewListener(
-		[]string{"localhost:9092"},
-		"accounts.money.transferred",
-		"inbox-service",
-		paymentUC,
-	)
+	paymentUC := usecases.NewPaymentUseCase(inboxRepo, processedRepo, dlqProducer)
 
-	// run kafka in background
+	listener := kafka.NewListener(brokers, topic, group, paymentUC)
 	go listener.Listen(ctx)
 
-	log.Println("service started")
-
-	// wait shutdown
-	<-sigCh
+	log.Println("inbox service started")
+	<-ctx.Done()
 	log.Println("shutdown signal received")
+}
 
-	cancel()
+func runMigrations(pool *pgxpool.Pool) error {
+	db := stdlib.OpenDBFromPool(pool)
+	defer db.Close()
+
+	if err := goose.SetDialect("postgres"); err != nil {
+		return err
+	}
+	return goose.Up(db, migrationsPath)
+}
+
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
