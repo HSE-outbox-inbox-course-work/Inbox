@@ -1,5 +1,7 @@
 package domain
 
+import "time"
+
 type InboxStatus string
 
 const (
@@ -8,11 +10,15 @@ const (
 	StatusFailed    InboxStatus = "FAILED"
 )
 
+// EventTime — момент вставки события в outbox; outbox-сервис проставляет его
+// в payload, Inbox использует только для замера end-to-end задержки доставки.
+// Если поле отсутствует или нулевое — наблюдение E2E просто пропускается.
 type TransferMessage struct {
-	Amount      int    `json:"amount"`
-	ToAccount   string `json:"to_account"`
-	TransferID  string `json:"transfer_id"`
-	FromAccount string `json:"from_account"`
+	Amount      int       `json:"amount"`
+	ToAccount   string    `json:"to_account"`
+	TransferID  string    `json:"transfer_id"`
+	FromAccount string    `json:"from_account"`
+	EventTime   time.Time `json:"event_time"`
 }
 
 type InboxRecord struct {

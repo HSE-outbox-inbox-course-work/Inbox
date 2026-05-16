@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"inbox/internal/domain"
+	"inbox/internal/metrics"
 )
 
 type InboxRepository interface {
@@ -25,27 +27,45 @@ type PaymentUseCase struct {
 	inbox     InboxRepository
 	processed ProcessedPaymentRepository
 	dlq       DeadLetterQueue
+	metrics   *metrics.Metrics
+	topic     string
 }
 
+// NewPaymentUseCase. topic нужен только чтобы метки duplicates_total/kafka
+// были осмысленными на дашборде — он не используется в бизнес-логике.
 func NewPaymentUseCase(
 	inbox InboxRepository,
 	processed ProcessedPaymentRepository,
 	dlq DeadLetterQueue,
+	m *metrics.Metrics,
+	topic string,
 ) *PaymentUseCase {
 	return &PaymentUseCase{
 		inbox:     inbox,
 		processed: processed,
 		dlq:       dlq,
+		metrics:   m,
+		topic:     topic,
 	}
 }
+
 func (uc *PaymentUseCase) ProcessPayment(
 	ctx context.Context,
 	msg domain.TransferMessage,
 ) error {
+	start := time.Now()
+	// outcome обновляется по ходу обработки; defer фиксирует итоговый исход
+	// в гистограмму и счётчик. При ранних return достаточно установить
+	// outcome до return — это безопаснее, чем строить отдельные defer'ы.
+	outcome := metrics.OutcomeProcessed
+	defer func() {
+		uc.metrics.ProcessingDuration.WithLabelValues(string(outcome)).Observe(time.Since(start).Seconds())
+		uc.metrics.MessagesProcessed.WithLabelValues(string(outcome)).Inc()
+	}()
 
-	// 1. СНАЧАЛА фиксируем факт получения (idempotency entry)
 	existing, err := uc.inbox.GetByTransferID(ctx, msg.TransferID)
 	if err != nil {
+		outcome = metrics.OutcomeProcessingError
 		return err
 	}
 
@@ -56,15 +76,24 @@ func (uc *PaymentUseCase) ProcessPayment(
 			Payload:    marshal(msg),
 		})
 		if err != nil {
+			outcome = metrics.OutcomeProcessingError
 			return err
 		}
 	} else if existing.Status == domain.StatusProcessed {
-		// уже обработано — выходим
+		// Дедупликация: то же transfer_id уже обработано. Замеряем явно —
+		// это ключевой сигнал, что at-least-once реально работает и в нём
+		// есть смысл (повторные сообщения действительно приходят и
+		// отбрасываются inbox-ом).
+		outcome = metrics.OutcomeDuplicate
+		uc.metrics.DuplicatesDetected.WithLabelValues(uc.topic).Inc()
 		return nil
 	}
 
-	// 2. валидация (теперь после фикса RECEIVED)
-	if err := validate(msg); err != nil {
+	if vErr := validate(msg); vErr != nil {
+		outcome = metrics.OutcomeValidationError
+		// failingField возвращает поле из текста ошибки validate; набор
+		// конечный, поэтому кардинальность метки контролируется.
+		uc.metrics.ValidationErrors.WithLabelValues(failingField(vErr)).Inc()
 
 		_ = uc.inbox.Save(ctx, &domain.InboxRecord{
 			TransferID: msg.TransferID,
@@ -75,14 +104,13 @@ func (uc *PaymentUseCase) ProcessPayment(
 		_ = uc.dlq.Put(ctx, domain.DeadLetterMessage{
 			TransferID: msg.TransferID,
 			Payload:    string(marshal(msg)),
-			Error:      err.Error(),
-			ErrorType:  "VALIDATION_ERROR",
+			Error:      vErr.Error(),
+			ErrorType:  string(metrics.ErrorTypeValidation),
 		})
 
 		return nil
 	}
 
-	// 3. бизнес обработка
 	err = uc.processed.Create(ctx, &domain.ProcessedPayment{
 		TransferID:  msg.TransferID,
 		Amount:      msg.Amount,
@@ -90,6 +118,7 @@ func (uc *PaymentUseCase) ProcessPayment(
 		ToAccount:   msg.ToAccount,
 	})
 	if err != nil {
+		outcome = metrics.OutcomeProcessingError
 
 		_ = uc.inbox.Save(ctx, &domain.InboxRecord{
 			TransferID: msg.TransferID,
@@ -101,18 +130,30 @@ func (uc *PaymentUseCase) ProcessPayment(
 			TransferID: msg.TransferID,
 			Payload:    string(marshal(msg)),
 			Error:      err.Error(),
-			ErrorType:  "PROCESSING_ERROR",
+			ErrorType:  string(metrics.ErrorTypeProcessing),
 		})
 
 		return err
 	}
 
-	// 4. успех → PROCESSED
-	return uc.inbox.Save(ctx, &domain.InboxRecord{
+	if err := uc.inbox.Save(ctx, &domain.InboxRecord{
 		TransferID: msg.TransferID,
 		Status:     domain.StatusProcessed,
 		Payload:    marshal(msg),
-	})
+	}); err != nil {
+		outcome = metrics.OutcomeProcessingError
+		return err
+	}
+
+	// E2E считаем только для свежеобработанных сообщений: дубликаты
+	// и валидационные ошибки делали бы метрику нерепрезентативной.
+	// EventTime приходит из outbox.MoneyTransferEvent.EventTime;
+	// если по какой-то причине пуст — пропускаем наблюдение.
+	if !msg.EventTime.IsZero() {
+		uc.metrics.DeliveryE2ELatency.Observe(time.Since(msg.EventTime).Seconds())
+	}
+
+	return nil
 }
 
 func marshal(v any) []byte {
@@ -122,16 +163,36 @@ func marshal(v any) []byte {
 
 func validate(msg domain.TransferMessage) error {
 	if msg.TransferID == "" {
-		return errors.New("missing transfer_id")
+		return errFieldMissing("transfer_id")
 	}
-	if msg.Amount <= 0 {
-		return errors.New("invalid amount")
+	if msg.Amount < 0 {
+		return errFieldInvalid("amount")
 	}
 	if msg.FromAccount == "" {
-		return errors.New("missing from_account")
+		return errFieldMissing("from_account")
 	}
 	if msg.ToAccount == "" {
-		return errors.New("missing to_account")
+		return errFieldMissing("to_account")
 	}
 	return nil
+}
+
+// fieldError позволяет в одной строке достать имя упавшего поля для метки.
+// Альтернатива — парсить ошибку строкой; явный тип проще и быстрее.
+type fieldError struct {
+	field string
+	msg   string
+}
+
+func (e *fieldError) Error() string { return e.msg + " " + e.field }
+
+func errFieldMissing(field string) error { return &fieldError{field: field, msg: "missing"} }
+func errFieldInvalid(field string) error { return &fieldError{field: field, msg: "invalid"} }
+
+func failingField(err error) string {
+	var fe *fieldError
+	if errors.As(err, &fe) {
+		return fe.field
+	}
+	return "unknown"
 }
