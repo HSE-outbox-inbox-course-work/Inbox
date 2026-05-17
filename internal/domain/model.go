@@ -10,9 +10,8 @@ const (
 	StatusFailed    InboxStatus = "FAILED"
 )
 
-// EventTime — момент вставки события в outbox; outbox-сервис проставляет его
-// в payload, Inbox использует только для замера end-to-end задержки доставки.
-// Если поле отсутствует или нулевое — наблюдение E2E просто пропускается.
+// EventTime проставляется outbox-сервисом в payload и используется для
+// замера end-to-end задержки. Нулевое значение — наблюдение пропускается.
 type TransferMessage struct {
 	Amount      int       `json:"amount"`
 	ToAccount   string    `json:"to_account"`

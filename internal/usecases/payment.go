@@ -31,8 +31,7 @@ type PaymentUseCase struct {
 	topic     string
 }
 
-// NewPaymentUseCase. topic нужен только чтобы метки duplicates_total/kafka
-// были осмысленными на дашборде — он не используется в бизнес-логике.
+// topic — только метка для метрик, в бизнес-логике не используется.
 func NewPaymentUseCase(
 	inbox InboxRepository,
 	processed ProcessedPaymentRepository,
@@ -54,9 +53,6 @@ func (uc *PaymentUseCase) ProcessPayment(
 	msg domain.TransferMessage,
 ) error {
 	start := time.Now()
-	// outcome обновляется по ходу обработки; defer фиксирует итоговый исход
-	// в гистограмму и счётчик. При ранних return достаточно установить
-	// outcome до return — это безопаснее, чем строить отдельные defer'ы.
 	outcome := metrics.OutcomeProcessed
 	defer func() {
 		uc.metrics.ProcessingDuration.WithLabelValues(string(outcome)).Observe(time.Since(start).Seconds())
@@ -80,10 +76,6 @@ func (uc *PaymentUseCase) ProcessPayment(
 			return err
 		}
 	} else if existing.Status == domain.StatusProcessed {
-		// Дедупликация: то же transfer_id уже обработано. Замеряем явно —
-		// это ключевой сигнал, что at-least-once реально работает и в нём
-		// есть смысл (повторные сообщения действительно приходят и
-		// отбрасываются inbox-ом).
 		outcome = metrics.OutcomeDuplicate
 		uc.metrics.DuplicatesDetected.WithLabelValues(uc.topic).Inc()
 		return nil
@@ -91,8 +83,6 @@ func (uc *PaymentUseCase) ProcessPayment(
 
 	if vErr := validate(msg); vErr != nil {
 		outcome = metrics.OutcomeValidationError
-		// failingField возвращает поле из текста ошибки validate; набор
-		// конечный, поэтому кардинальность метки контролируется.
 		uc.metrics.ValidationErrors.WithLabelValues(failingField(vErr)).Inc()
 
 		_ = uc.inbox.Save(ctx, &domain.InboxRecord{
@@ -145,10 +135,8 @@ func (uc *PaymentUseCase) ProcessPayment(
 		return err
 	}
 
-	// E2E считаем только для свежеобработанных сообщений: дубликаты
-	// и валидационные ошибки делали бы метрику нерепрезентативной.
-	// EventTime приходит из outbox.MoneyTransferEvent.EventTime;
-	// если по какой-то причине пуст — пропускаем наблюдение.
+	// E2E считаем только для свежеобработанных сообщений: дубликаты и
+	// валидационные ошибки делали бы гистограмму нерепрезентативной.
 	if !msg.EventTime.IsZero() {
 		uc.metrics.DeliveryE2ELatency.Observe(time.Since(msg.EventTime).Seconds())
 	}
@@ -177,8 +165,8 @@ func validate(msg domain.TransferMessage) error {
 	return nil
 }
 
-// fieldError позволяет в одной строке достать имя упавшего поля для метки.
-// Альтернатива — парсить ошибку строкой; явный тип проще и быстрее.
+// fieldError несёт имя упавшего поля, чтобы failingField его извлекал
+// без парсинга строки сообщения.
 type fieldError struct {
 	field string
 	msg   string

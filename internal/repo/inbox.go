@@ -2,7 +2,9 @@ package repository
 
 import (
 	"context"
+	"errors"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"inbox/internal/domain"
@@ -17,21 +19,30 @@ func NewInboxRepository(pool *pgxpool.Pool) *InboxRepository {
 }
 
 func (r *InboxRepository) GetByTransferID(ctx context.Context, id string) (*domain.InboxRecord, error) {
+	// transfer_id::text и status::text — pgx v5 без явной регистрации
+	// типов не сканирует Postgres UUID и enum-подобные VARCHAR в Go
+	// string и в типизированные string-alias'ы (как domain.InboxStatus).
+	// Кастуем в text на стороне БД и сканируем в обычный string;
+	// status потом приводим к InboxStatus уже в Go.
 	query := `
-		SELECT id, transfer_id, status, payload
+		SELECT id, transfer_id::text, status::text, payload
 		FROM inbox_order
 		WHERE transfer_id = $1
 		LIMIT 1
 	`
 
-	row := r.pool.QueryRow(ctx, query, id)
-
-	var res domain.InboxRecord
-	err := row.Scan(&res.ID, &res.TransferID, &res.Status, &res.Payload)
-	if err != nil {
+	var (
+		res    domain.InboxRecord
+		status string
+	)
+	err := r.pool.QueryRow(ctx, query, id).Scan(&res.ID, &res.TransferID, &status, &res.Payload)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
-
+	if err != nil {
+		return nil, err
+	}
+	res.Status = domain.InboxStatus(status)
 	return &res, nil
 }
 

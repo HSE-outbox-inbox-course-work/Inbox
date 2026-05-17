@@ -52,9 +52,6 @@ func main() {
 		log.Fatalf("migrations failed: %v", err)
 	}
 
-	// Свой реестр без default-коллекторов — детерминированный /metrics,
-	// без мусорных промежуточных метрик от чужих пакетов. process_* и go_*
-	// добавляем явно, они нужны для USE-методологии (RAM, GC, потоки).
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
@@ -62,9 +59,6 @@ func main() {
 	)
 	svcMetrics := metrics.New(reg)
 
-	// Фоновый коллектор: pgxpool.Stat() + COUNT(*) GROUP BY status по
-	// inbox_order. Интервал 5s — компромисс между свежестью данных и
-	// нагрузкой на БД (запрос быстрый, table небольшой).
 	go svcMetrics.Run(ctx, dbpool, 5*time.Second)
 
 	inboxRepo := repository.NewInboxRepository(dbpool)
@@ -77,9 +71,7 @@ func main() {
 	listener := kafka.NewListener(brokers, topic, group, paymentUC, svcMetrics)
 	go listener.Listen(ctx)
 
-	// HTTP-сервер только для /metrics. Inbox — фоновый воркер, никаких
-	// бизнес-эндпойнтов у него нет; отдельный mux нужен, чтобы Prometheus
-	// мог его скрейпить.
+	// Отдельный mux только под /metrics — у Inbox нет HTTP API.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	metricsSrv := &http.Server{

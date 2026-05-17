@@ -1,13 +1,8 @@
-// Package metrics держит описания всех Prometheus-метрик inbox-сервиса
-// и их регистрацию в реестре. Сами места инкрементов разнесены по слоям:
+// Package metrics регистрирует Prometheus-метрики inbox-сервиса.
+// Инкременты разнесены по слоям: Kafka Listener, PaymentUseCase, DLQProducer.
+// Фоновый Run() обновляет gauge'и pgxpool и таблицы inbox_order.
 //
-//   - чтение из Kafka — в Listener (internal/integrations/payments/consumer);
-//   - бизнес-обработка платежа — в usecase PaymentUseCase;
-//   - публикация в DLQ — в DLQProducer (internal/integrations/dlq);
-//   - состояние pgx-пула и таблицы inbox_order — фоновый сборщик Run().
-//
-// Namespace "inbox" даёт префикс inbox_* у всех имён и отделяет сервисные
-// метрики от инфраструктурных (pg_*, kafka_*).
+// Namespace inbox_ отделяет сервисные метрики от инфраструктурных (pg_*, kafka_*).
 package metrics
 
 import (
@@ -21,19 +16,15 @@ import (
 
 const namespace = "inbox"
 
-// Buckets для бизнес-длительностей: одна обработка сообщения — это пара
-// DB-запросов и одна публикация в Kafka (DLQ), поэтому диапазон от долей мс
-// до пары секунд достаточен.
 var processingBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}
 
-// e2eBuckets — задержка от момента вставки в outbox до фиксации в inbox.
-// На стенде это десятки миллисекунд, но в плохом сценарии (остановка
-// потребителя) задержка может расти до десятков секунд, поэтому верхний
-// предел заметно шире.
+// e2eBuckets — задержка outbox.event_time -> inbox.processed. Верхний край
+// шире обычного, потому что при простое потребителя задержка может
+// измеряться десятками секунд.
 var e2eBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300}
 
-// Outcome — конечный набор значений метки outcome. Только перечислимые
-// значения, иначе rate(...) by (outcome) даст случайные имена.
+// Outcome — конечный набор значений метки outcome, чтобы кардинальность
+// не разрасталась случайными строками.
 type Outcome string
 
 const (
@@ -43,8 +34,6 @@ const (
 	OutcomeProcessingError Outcome = "processing_error"
 )
 
-// ErrorType — короткий конечный список причин отправки в DLQ.
-// Соответствует Inbox usecase: либо валидация, либо ошибка обработки.
 type ErrorType string
 
 const (
@@ -52,32 +41,22 @@ const (
 	ErrorTypeProcessing ErrorType = "PROCESSING_ERROR"
 )
 
-// Metrics — контейнер всех коллекторов. Передаётся по указателю в те места,
-// которым нужно делать наблюдения; nil-безопасных методов нет.
 type Metrics struct {
-	// Kafka consumer
-	KafkaMessagesRead *prometheus.CounterVec // по topic+outcome (ok / decode_error)
+	KafkaMessagesRead *prometheus.CounterVec
 
-	// Бизнес-обработка
-	ProcessingDuration *prometheus.HistogramVec // по outcome
-	MessagesProcessed  *prometheus.CounterVec   // по outcome
+	ProcessingDuration *prometheus.HistogramVec
+	MessagesProcessed  *prometheus.CounterVec
 
-	// Дедупликация и валидация
-	DuplicatesDetected *prometheus.CounterVec // по topic
-	ValidationErrors   *prometheus.CounterVec // по field — какое поле упало
+	DuplicatesDetected *prometheus.CounterVec
+	ValidationErrors   *prometheus.CounterVec
 
-	// DLQ producer
-	DLQMessagesProduced *prometheus.CounterVec     // по error_type + outcome (ok / send_error)
-	DLQProduceDuration  *prometheus.HistogramVec   // по outcome
+	DLQMessagesProduced *prometheus.CounterVec
+	DLQProduceDuration  *prometheus.HistogramVec
 
-	// E2E latency: now - outbox.event_time, измеряется когда платёж
-	// в inbox финально получает статус PROCESSED.
 	DeliveryE2ELatency prometheus.Histogram
 
-	// Состояние таблицы inbox_order (фоновый сбор)
-	InboxTableRows *prometheus.GaugeVec // по status
+	InboxTableRows *prometheus.GaugeVec
 
-	// pgx pool stats (фоновый сбор)
 	PoolAcquired    prometheus.Gauge
 	PoolIdle        prometheus.Gauge
 	PoolTotal       prometheus.Gauge
@@ -178,8 +157,8 @@ func New(reg prometheus.Registerer) *Metrics {
 	return m
 }
 
-// Run запускает фоновый сборщик: раз в interval опрашивает pgxpool.Stat()
-// и считает строки в inbox_order по статусам. Останавливается по ctx.Done().
+// Run периодически снимает pgxpool.Stat() и считает строки в inbox_order
+// по статусам. Останавливается по ctx.Done().
 func (m *Metrics) Run(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -203,8 +182,6 @@ func (m *Metrics) collectOnce(ctx context.Context, pool *pgxpool.Pool) {
 	m.PoolMax.Set(float64(stat.MaxConns()))
 	m.PoolAcquireWait.Set(float64(stat.EmptyAcquireCount()))
 
-	// GROUP BY по status даёт три строки максимум (RECEIVED / PROCESSED / FAILED),
-	// этого достаточно чтобы построить разбивку без скана payload.
 	rows, err := pool.Query(ctx,
 		`SELECT status, COUNT(*) FROM inbox_order GROUP BY status`)
 	if err != nil {

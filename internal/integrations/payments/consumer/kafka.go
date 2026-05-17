@@ -41,13 +41,11 @@ type Envelope struct {
 	Payload string `json:"payload"`
 }
 
-// outcome для kafka_messages_read_total — короткий конечный набор:
-// успех или конкретная стадия, на которой сломались.
 const (
-	readOutcomeOK            = "ok"
-	readOutcomeReadError     = "read_error"
-	readOutcomeBadEnvelope   = "bad_envelope"
-	readOutcomeBadPayload    = "bad_payload"
+	readOutcomeOK          = "ok"
+	readOutcomeReadError   = "read_error"
+	readOutcomeBadEnvelope = "bad_envelope"
+	readOutcomeBadPayload  = "bad_payload"
 )
 
 func (l *Listener) Listen(ctx context.Context) {
@@ -56,8 +54,7 @@ func (l *Listener) Listen(ctx context.Context) {
 	for {
 		msg, err := l.reader.ReadMessage(ctx)
 		if err != nil {
-			// Контекст закрыт штатно при shutdown — не считаем это ошибкой
-			// чтения, иначе на каждом выходе будет ложный пик метрики.
+			// Штатное закрытие контекста не считаем ошибкой чтения.
 			if errors.Is(err, context.Canceled) {
 				return
 			}

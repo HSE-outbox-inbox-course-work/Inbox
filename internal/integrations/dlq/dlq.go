@@ -28,8 +28,6 @@ func NewDLQProducer(brokers []string, topic string, m *metrics.Metrics) *DLQProd
 	}
 }
 
-// outcome для счётчика DLQ — публикация либо прошла, либо упала на одной
-// из двух стадий. Эти три значения покрывают всё, метки не разрастаются.
 const (
 	dlqOutcomeOK         = "ok"
 	dlqOutcomeMarshalErr = "marshal_error"
